@@ -8,6 +8,25 @@ from typing import Iterator
 
 from .config import DB_PATH
 
+# Objects added by the handover-manifest feature.  Everything is additive so
+# databases created by older releases keep working: new tables are created with
+# IF NOT EXISTS and the new publication column is added only when absent.
+MANIFEST_TABLES = """
+CREATE TABLE IF NOT EXISTS manifests (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    station          TEXT    NOT NULL,
+    minute_utc       TEXT    NOT NULL,
+    manifest_revision INTEGER NOT NULL CHECK (manifest_revision >= 1),
+    entries          TEXT    NOT NULL,
+    manifest_hash    TEXT    NOT NULL,
+    created_at       TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    UNIQUE (station, minute_utc, manifest_revision)
+);
+
+CREATE INDEX IF NOT EXISTS idx_manifests_minute
+    ON manifests (station, minute_utc);
+"""
+
 SCHEMA = """
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
@@ -55,6 +74,16 @@ CREATE INDEX IF NOT EXISTS idx_pub_items_pub
 """
 
 
+def _migrate_legacy_schema(conn: sqlite3.Connection) -> None:
+    """Bring a database written by an older release up to the current schema."""
+    pub_cols = {row["name"] for row in conn.execute("PRAGMA table_info(publications)")}
+    if "manifest_revision" not in pub_cols:
+        # NULL marks publications created before manifests existed.
+        conn.execute(
+            "ALTER TABLE publications ADD COLUMN manifest_revision INTEGER"
+        )
+
+
 def _connect(db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path), timeout=30)
@@ -73,6 +102,8 @@ def init_db(db_path: Path | None = None) -> None:
     conn = _connect(path)
     try:
         conn.executescript(SCHEMA)
+        _migrate_legacy_schema(conn)
+        conn.executescript(MANIFEST_TABLES)
         conn.commit()
     finally:
         conn.close()

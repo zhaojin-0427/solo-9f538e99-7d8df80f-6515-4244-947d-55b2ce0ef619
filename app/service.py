@@ -1,9 +1,9 @@
-"""Business logic: fragment uploads, minute assembly and publications.
+"""Business logic: manifests, fragment uploads, reconciliation and publishing.
 
 All mutating operations run inside a single ``BEGIN IMMEDIATE`` SQLite
-transaction so that uploads and publications serialize on one consistent
-snapshot of the fragment set.  Any error rolls the whole transaction back —
-no half-written publications are ever left behind.
+transaction so that manifest writes, uploads and publications serialize on one
+consistent snapshot.  Any error rolls the whole transaction back — no
+half-written manifests or publications are ever left behind.
 """
 from __future__ import annotations
 
@@ -40,6 +40,18 @@ class ContentConflictError(ServiceError):
     status_code = 409
 
 
+class ManifestRevisionError(ServiceError):
+    """Incoming manifest revision is not higher than the current one."""
+
+    status_code = 409
+
+
+class ManifestConflictError(ServiceError):
+    """Same manifest revision resubmitted with different content."""
+
+    status_code = 409
+
+
 class NotPublishableError(ServiceError):
     status_code = 409
 
@@ -68,6 +80,33 @@ def content_hash(start_sample: int, samples: list[int]) -> str:
         {"start_sample": start_sample, "samples": samples}, separators=(",", ":")
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def manifest_hash(entries: list[dict[str, Any]]) -> str:
+    """Stable SHA-256 over the manifest's canonical entry list."""
+    canonical = sorted(
+        (
+            {
+                "fragment_no": e["fragment_no"],
+                "revision": e["revision"],
+                "content_hash": e["content_hash"],
+            }
+            for e in entries
+        ),
+        key=lambda e: e["fragment_no"],
+    )
+    blob = json.dumps(canonical, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()
+
+
+def _dump_entries(entries: list[dict[str, Any]]) -> str:
+    return json.dumps(
+        sorted(entries, key=lambda e: e["fragment_no"]), separators=(",", ":")
+    )
+
+
+def _load_entries(raw: str) -> list[dict[str, Any]]:
+    return json.loads(raw)
 
 
 def _fragment_set_hash(rows: list[sqlite3.Row]) -> str:
@@ -113,6 +152,28 @@ def _get_fragments(
     ).fetchall()
 
 
+def _get_latest_manifest(
+    conn: sqlite3.Connection, station: str, minute: str
+) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM manifests WHERE station = ? AND minute_utc = ? "
+        "ORDER BY manifest_revision DESC, id DESC LIMIT 1",
+        (station, minute),
+    ).fetchone()
+
+
+def _row_to_manifest(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "station": row["station"],
+        "minute_utc": _parse_minute(row["minute_utc"]),
+        "manifest_revision": row["manifest_revision"],
+        "entries": _load_entries(row["entries"]),
+        "manifest_hash": row["manifest_hash"],
+        "created_at": row["created_at"],
+    }
+
+
 # --------------------------------------------------------------------------- #
 # Assembly
 # --------------------------------------------------------------------------- #
@@ -152,7 +213,173 @@ def compute_assembly(rows: list[sqlite3.Row]) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- #
-# Upload
+# Reconciliation
+# --------------------------------------------------------------------------- #
+def _reconcile(
+    manifest: sqlite3.Row | None, fragment_rows: list[sqlite3.Row]
+) -> dict[str, Any]:
+    """Compare the current manifest against the effective fragment set.
+
+    Every manifest line ends in exactly one bucket:
+    ``matched`` / ``missing`` / ``revision_mismatch`` / ``content_mismatch``.
+    Uploaded fragments without a manifest line are reported as ``extras``.
+    """
+    fragments_by_no = {r["fragment_no"]: r for r in fragment_rows}
+    matched: list[dict[str, Any]] = []
+    missing: list[dict[str, Any]] = []
+    revision_mismatches: list[dict[str, Any]] = []
+    content_mismatches: list[dict[str, Any]] = []
+
+    expected_nos: set[int] = set()
+    if manifest is not None:
+        for entry in _load_entries(manifest["entries"]):
+            no = entry["fragment_no"]
+            expected_nos.add(no)
+            item = {
+                "fragment_no": no,
+                "expected_revision": entry["revision"],
+                "expected_content_hash": entry["content_hash"],
+            }
+            frag = fragments_by_no.get(no)
+            if frag is None:
+                missing.append(item)
+                continue
+            item["actual_revision"] = frag["revision"]
+            item["actual_content_hash"] = frag["content_hash"]
+            if frag["revision"] != entry["revision"]:
+                revision_mismatches.append(item)
+            elif frag["content_hash"] != entry["content_hash"]:
+                content_mismatches.append(item)
+            else:
+                matched.append(item)
+
+    extras = [
+        _row_to_fragment(r) for r in fragment_rows if r["fragment_no"] not in expected_nos
+    ]
+    reconciled = (
+        manifest is not None
+        and not missing
+        and not revision_mismatches
+        and not content_mismatches
+        and not extras
+    )
+    return {
+        "matched": matched,
+        "missing": missing,
+        "revision_mismatches": revision_mismatches,
+        "content_mismatches": content_mismatches,
+        "extra_fragments": extras,
+        "reconciled": reconciled,
+    }
+
+
+def get_reconciliation(station: str, minute_dt: datetime) -> dict[str, Any]:
+    minute = minute_key(minute_dt)
+    with get_conn() as conn:
+        # One read-only snapshot: manifest and fragments come from the same
+        # committed state even while writers interleave around this request.
+        manifest = _get_latest_manifest(conn, station, minute)
+        rows = _get_fragments(conn, station, minute)
+        recon = _reconcile(manifest, rows)
+        assembly = compute_assembly(rows)
+
+    return {
+        "station": station,
+        "minute_utc": _parse_minute(minute),
+        "manifest_present": manifest is not None,
+        "manifest_revision": None if manifest is None else manifest["manifest_revision"],
+        "manifest_hash": None if manifest is None else manifest["manifest_hash"],
+        **recon,
+        **assembly,
+        "publishable": bool(
+            manifest is not None and recon["reconciled"] and assembly["complete"]
+        ),
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Manifest writes
+# --------------------------------------------------------------------------- #
+def submit_manifest(payload: dict[str, Any]) -> dict[str, Any]:
+    station = payload["station"]
+    minute = minute_key(payload["minute_utc"])
+    revision = payload["manifest_revision"]
+    entries = [dict(e) for e in payload["entries"]]
+    new_hash = manifest_hash(entries)
+    entries_json = _dump_entries(entries)
+
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            current = _get_latest_manifest(conn, station, minute)
+            if current is not None:
+                if revision < current["manifest_revision"]:
+                    raise ManifestRevisionError(
+                        f"manifest for this station-minute is already at revision "
+                        f"{current['manifest_revision']}; incoming revision "
+                        f"{revision} is not higher"
+                    )
+                if revision == current["manifest_revision"]:
+                    # Same version: identical content is an idempotent retry and
+                    # returns the original manifest; different text is refused.
+                    if current["manifest_hash"] == new_hash:
+                        result = _row_to_manifest(current)
+                        result["status"] = "unchanged"
+                        conn.commit()
+                        return result
+                    raise ManifestConflictError(
+                        f"manifest revision {revision} already exists with "
+                        "different entries"
+                    )
+                # Higher revision: persist the new list and supersede older ones.
+            cur = conn.execute(
+                "INSERT INTO manifests (station, minute_utc, manifest_revision, "
+                "entries, manifest_hash) VALUES (?, ?, ?, ?, ?)",
+                (station, minute, revision, entries_json, new_hash),
+            )
+            # A newer handover list supersedes every earlier publication of this
+            # minute: its frozen wave and source stay readable, but it is no
+            # longer the current publication.
+            conn.execute(
+                "UPDATE publications SET stale = 1 WHERE station = ? "
+                "AND minute_utc = ? AND stale = 0",
+                (station, minute),
+            )
+            row = conn.execute(
+                "SELECT * FROM manifests WHERE id = ?", (cur.lastrowid,)
+            ).fetchone()
+            conn.commit()
+            result = _row_to_manifest(row)
+            result["status"] = "accepted" if current is None else "superseded"
+            return result
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def get_manifest(station: str, minute_dt: datetime) -> dict[str, Any] | None:
+    minute = minute_key(minute_dt)
+    with get_conn() as conn:
+        row = _get_latest_manifest(conn, station, minute)
+        return None if row is None else _row_to_manifest(row)
+
+
+def list_manifest_revisions(
+    station: str, minute_dt: datetime
+) -> list[dict[str, Any]]:
+    """Full revision history, newest first (source provenance)."""
+    minute = minute_key(minute_dt)
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM manifests WHERE station = ? AND minute_utc = ? "
+            "ORDER BY manifest_revision DESC",
+            (station, minute),
+        ).fetchall()
+        return [_row_to_manifest(r) for r in rows]
+
+
+# --------------------------------------------------------------------------- #
+# Fragment upload
 # --------------------------------------------------------------------------- #
 def upload_fragment(payload: dict[str, Any]) -> dict[str, Any]:
     station = payload["station"]
@@ -285,11 +512,12 @@ def _refresh_staleness(conn: sqlite3.Connection, pub: sqlite3.Row) -> sqlite3.Ro
     return pub
 
 
-def _hydrate_publication(conn: sqlite3.Row, pub: sqlite3.Row) -> dict[str, Any]:
+def _hydrate_publication(conn: sqlite3.Connection, pub: sqlite3.Row) -> dict[str, Any]:
     items = conn.execute(
         "SELECT * FROM publication_items WHERE publication_id = ? ORDER BY fragment_no",
         (pub["id"],),
     ).fetchall()
+    keys = pub.keys()
     return {
         "id": pub["id"],
         "station": pub["station"],
@@ -297,6 +525,7 @@ def _hydrate_publication(conn: sqlite3.Row, pub: sqlite3.Row) -> dict[str, Any]:
         "wave": load_samples(pub["wave"]),
         "stale": bool(pub["stale"]),
         "fragment_set_hash": pub["fragment_set_hash"],
+        "manifest_revision": pub["manifest_revision"] if "manifest_revision" in keys else None,
         "created_at": pub["created_at"],
         "items": [
             {
@@ -365,14 +594,55 @@ def get_latest_publication(station: str, minute_dt: datetime) -> dict[str, Any] 
 # --------------------------------------------------------------------------- #
 # Publish
 # --------------------------------------------------------------------------- #
+def _reconciliation_blockers(recon: dict[str, Any]) -> str:
+    parts: list[str] = []
+    if recon["missing"]:
+        parts.append(
+            "missing fragments: "
+            + ",".join(str(i["fragment_no"]) for i in recon["missing"])
+        )
+    if recon["revision_mismatches"]:
+        parts.append(
+            "revision mismatches: "
+            + ",".join(
+                f"{i['fragment_no']}(expected {i['expected_revision']}, "
+                f"got {i['actual_revision']})"
+                for i in recon["revision_mismatches"]
+            )
+        )
+    if recon["content_mismatches"]:
+        parts.append(
+            "content mismatches: "
+            + ",".join(str(i["fragment_no"]) for i in recon["content_mismatches"])
+        )
+    if recon["extra_fragments"]:
+        parts.append(
+            "fragments outside manifest: "
+            + ",".join(str(f["fragment_no"]) for f in recon["extra_fragments"])
+        )
+    return "; ".join(parts)
+
+
 def publish_minute(station: str, minute_dt: datetime) -> dict[str, Any]:
     minute = minute_key(minute_dt)
     with get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         try:
+            # Everything below reads one single committed snapshot: the manifest,
+            # the fragment set, the assembly and any existing publication.
             rows = _get_fragments(conn, station, minute)
             assembly = compute_assembly(rows)
+            manifest = _get_latest_manifest(conn, station, minute)
+            recon = _reconcile(manifest, rows)
 
+            if manifest is None:
+                raise NotPublishableError(
+                    "no handover manifest for this station-minute"
+                )
+            if not recon["reconciled"]:
+                raise NotPublishableError(
+                    "manifest not fully matched: " + _reconciliation_blockers(recon)
+                )
             if not rows:
                 raise NotPublishableError("no fragments for this station-minute")
             if assembly["gaps"]:
@@ -389,13 +659,15 @@ def publish_minute(station: str, minute_dt: datetime) -> dict[str, Any]:
                 raise NotPublishableError(f"unresolved conflicts: {detail}")
 
             set_hash = _fragment_set_hash(rows)
+            manifest_rev = manifest["manifest_revision"]
 
-            # A fresh publication for this exact fragment set already exists:
-            # return it instead of creating a duplicate.
+            # A fresh publication for this exact fragment set *and* manifest
+            # revision already exists: return it instead of duplicating.
             existing = conn.execute(
                 "SELECT * FROM publications WHERE station = ? AND minute_utc = ? "
-                "AND fragment_set_hash = ? AND stale = 0 ORDER BY id DESC LIMIT 1",
-                (station, minute, set_hash),
+                "AND fragment_set_hash = ? AND manifest_revision = ? AND stale = 0 "
+                "ORDER BY id DESC LIMIT 1",
+                (station, minute, set_hash, manifest_rev),
             ).fetchone()
             if existing is not None:
                 result = _hydrate_publication(conn, existing)
@@ -411,8 +683,9 @@ def publish_minute(station: str, minute_dt: datetime) -> dict[str, Any]:
 
             cur = conn.execute(
                 "INSERT INTO publications (station, minute_utc, wave, "
-                "fragment_set_hash, stale) VALUES (?, ?, ?, ?, 0)",
-                (station, minute, dump_samples(wave), set_hash),
+                "fragment_set_hash, manifest_revision, stale) "
+                "VALUES (?, ?, ?, ?, ?, 0)",
+                (station, minute, dump_samples(wave), set_hash, manifest_rev),
             )
             pub_id = cur.lastrowid
             conn.executemany(

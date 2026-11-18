@@ -15,7 +15,10 @@ from .models import (
     AssemblyOut,
     FragmentIn,
     FragmentOut,
+    ManifestIn,
+    ManifestOut,
     PublicationOut,
+    ReconciliationOut,
 )
 
 
@@ -27,10 +30,11 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Seismic Waveform Assembly API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
-        "Ingest out-of-order waveform fragments, assemble them into whole "
-        "UTC-minute records and publish immutable minutes for phase pickers."
+        "Ingest out-of-order waveform fragments against upstream handover "
+        "manifests, reconcile them, assemble whole UTC-minute records and "
+        "publish immutable minutes for phase pickers."
     ),
     lifespan=lifespan,
 )
@@ -48,11 +52,53 @@ class UploadOut(FragmentOut):
     status: str
 
 
+class ManifestSubmitOut(ManifestOut):
+    status: str
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+# --------------------------------------------------------------------------- #
+# Handover manifests
+# --------------------------------------------------------------------------- #
+@app.post("/manifests", response_model=ManifestSubmitOut, status_code=201)
+def submit_manifest(manifest: ManifestIn) -> dict[str, Any]:
+    return service.submit_manifest(manifest.model_dump())
+
+
+@app.get("/manifests", response_model=ManifestOut)
+def get_manifest(
+    station: str = Query(min_length=1),
+    minute_utc: datetime = Query(description="UTC minute, e.g. 2026-11-17T05:06:00Z"),
+) -> JSONResponse | dict[str, Any]:
+    result = service.get_manifest(station, minute_utc)
+    if result is None:
+        return JSONResponse(status_code=404, content={"detail": "manifest not found"})
+    return result
+
+
+@app.get("/manifests/revisions", response_model=list[ManifestOut])
+def list_manifest_revisions(
+    station: str = Query(min_length=1),
+    minute_utc: datetime = Query(description="UTC minute, e.g. 2026-11-17T05:06:00Z"),
+) -> list[dict[str, Any]]:
+    return service.list_manifest_revisions(station, minute_utc)
+
+
+@app.get("/reconciliation", response_model=ReconciliationOut)
+def get_reconciliation(
+    station: str = Query(min_length=1),
+    minute_utc: datetime = Query(description="UTC minute, e.g. 2026-11-17T05:06:00Z"),
+) -> dict[str, Any]:
+    return service.get_reconciliation(station, minute_utc)
+
+
+# --------------------------------------------------------------------------- #
+# Fragments
+# --------------------------------------------------------------------------- #
 @app.post("/fragments", response_model=UploadOut, status_code=201)
 def upload_fragment(frag: FragmentIn) -> dict[str, Any]:
     return service.upload_fragment(frag.model_dump())
@@ -74,6 +120,9 @@ def get_assembly(
     return service.get_assembly(station, minute_utc)
 
 
+# --------------------------------------------------------------------------- #
+# Publications
+# --------------------------------------------------------------------------- #
 @app.post("/publications", response_model=PublicationOut, status_code=201)
 def publish_minute(
     station: str = Query(min_length=1),
